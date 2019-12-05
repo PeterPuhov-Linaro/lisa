@@ -58,6 +58,37 @@ def df_refit_index(df, start=None, end=None, method='pre'):
     return _data_refit_index(df, start, end, method=method)
 
 
+def df_split_signals(df, signal_cols, align_start=False):
+    """
+    Yield subset of ``df`` that only contain one signal, along with the signal
+    identification values.
+
+    :param df: The dataframe to split.
+    :type df: pandas.DataFrame
+
+    :param signal_cols: Columns that uniquely identify a signal.
+    :type signal_cols: list(str)
+
+    :param align_start: If ``True``, :func:`df_refit_index` will be applied on
+        the yielded dataframes so that they all start at the same index.
+    :type refit_index: bool
+    """
+
+    grouped = df.groupby(signal_cols)
+    for group, index in grouped.groups.items():
+        # When only one column is looked at, the group is the value instead of
+        # a tuple of values
+        if len(signal_cols) < 2:
+            cols_val = {signal_cols[0]: group}
+        else:
+            cols_val = dict(zip(signal_cols, group))
+
+        signal = grouped.get_group(group)
+        if align_start:
+            signal = df_refit_index(signal, start=df.index[0], method='inclusive')
+        yield (cols_val, signal)
+
+
 def _data_refit_index(data, start, end, method):
     if data.empty:
         return data
@@ -99,26 +130,26 @@ def df_squash(df, start, end, column='delta'):
     Slice a dataframe to [start:end], and work on the time data so that it
     makes sense within the interval.
 
-    Examples to make it clearer:
+    Examples to make it clearer::
 
-    df is:
-    Time len state
-    15    1   1
-    16    1   0
-    17    1   1
-    18    1   0
-    -------------
+        df is:
+        Time len state
+        15    1   1
+        16    1   0
+        17    1   1
+        18    1   0
+        -------------
 
-    df_squash(df, 16.5, 17.5) =>
+        df_squash(df, 16.5, 17.5) =>
 
-    Time len state
-    16.5  .5   0
-    17    .5   1
+        Time len state
+        16.5  .5   0
+        17    .5   1
 
-    df_squash(df, 16.2, 16.8) =>
+        df_squash(df, 16.2, 16.8) =>
 
-    Time len state
-    16.2  .6   0
+        Time len state
+        16.2  .6   0
 
     :returns: a new df that fits the above description
     """
@@ -324,9 +355,7 @@ def series_integrate(y, x=None, sign=None, method='rect', rect_step='post'):
 
         - Step: Post
 
-            Consider the following time series data
-
-            .. code::
+            Consider the following time series data::
 
                 2            *----*----*----+
                              |              |
@@ -334,8 +363,6 @@ def series_integrate(y, x=None, sign=None, method='rect', rect_step='post'):
                              |
                 0  *----*----+
                    0    1    2    3    4    5    6    7
-
-            .. code::
 
                 import pandas as pd
                 a = [0, 0, 2, 2, 2, 1, 1]
@@ -350,7 +377,7 @@ def series_integrate(y, x=None, sign=None, method='rect', rect_step='post'):
 
         - Step: Pre
 
-            .. code::
+            ::
 
                 2       +----*----*----*
                         |              |
@@ -358,8 +385,6 @@ def series_integrate(y, x=None, sign=None, method='rect', rect_step='post'):
                         |
                 0  *----*
                    0    1    2    3    4    5    6    7
-
-            .. code::
 
                 import pandas as pd
                 a = [0, 0, 2, 2, 2, 1, 1]
@@ -518,6 +543,74 @@ def df_window(df, window, method='inclusive', clip_window=False):
     Same as :func:`series_window` but acting on a :class:`pandas.DataFrame`
     """
     return _data_window(df, window, method, clip_window)
+
+
+def df_window_signals(df, window, signal_cols, compress_init=False):
+    """
+    Similar to :func:`df_window` with ``method='pre'`` but guarantees that each
+    signal will have a values at the beginning of the window.
+
+    :param window: two-tuple of index values for the start and end of the
+        region to select.
+    :type window: tuple(object)
+
+    :param signal_cols: Columns that uniquely identify a signal.
+    :type signal_cols: list(str)
+
+    :param compress_init: When ``False``, the timestamps of the init value of
+        signals (right before the window) are preserved. If ``True``, they are
+        changed into values as close as possible to the beginning of the window.
+    :type compress_init: bool
+
+    .. seealso:: :func:`df_split_signals`
+    """
+
+    def signal_in_window(signal_df, window):
+        start = window[0]
+        index = signal_df.index
+        signal_start, signal_end = index[0], index[-1]
+        # Signals are encoded as transitions, so as soon as we a transition
+        # inside the window, we know that the signal is relevant
+        return signal_start <= start <= signal_end
+
+    # Get the value of each signal at the beginning of the window
+    signal_df_list = [
+        df_window(signal_df, window, method='pre')
+        for signal, signal_df in df_split_signals(df, signal_cols, align_start=False)
+        # Only consider the signal that are in the window. Signals that started
+        # after the window are irrelevant.
+        if signal_in_window(signal_df, window)
+    ]
+
+    windowed_df = df_window(df, window, method='pre')
+
+    if compress_init:
+        def make_init_df_index(init_df):
+            # Yield a sequence of numbers incrementing by the smallest amount
+            # possible
+            def smallest_increment(start, length):
+                curr = start
+                for _ in range(length):
+                    curr = np.nextafter(curr, -math.inf)
+                    yield curr
+
+            index = list(smallest_increment(windowed_df.index[0], len(init_df)))
+            index = pd.Float64Index(reversed(index))
+            return index
+    else:
+        def make_init_df_index(init_df):
+            return init_df.index
+
+    # Get the last row before the beginning the window for each signal, in
+    # timestamp order
+    init_df = pd.concat(
+        # First row of the dataframe
+        signal_df.iloc[0:1]
+        for signal_df in sorted(signal_df_list, key=lambda df: df.index[0])
+    )
+
+    init_df.index = make_init_df_index(init_df)
+    return pd.concat([init_df, windowed_df])
 
 
 def series_align_signal(ref, to_align, max_shift=None):
@@ -743,8 +836,8 @@ def _data_deduplicate(data, keep, consecutives, cols, all_col):
 
         return data[cond]
     else:
-        if not all_cols:
-            raise ValueError("all_cols=False is not supported with consecutives=False")
+        if not all_col:
+            raise ValueError("all_col=False is not supported with consecutives=False")
 
         kwargs = dict(subset=cols) if cols else {}
         return data.drop_duplicates(keep=keep, **kwargs)

@@ -27,6 +27,7 @@ import itertools
 import weakref
 from statistics import mean
 import contextlib
+from operator import itemgetter
 
 from devlib import TargetStableError
 
@@ -131,13 +132,13 @@ class RTA(Workload):
             # Average in a capacity class, since the kernel will only use one
             # value for the whole class anyway
             new_capacities = {}
-            for cpus in plat_info['capacity-classes']:
+            for capa_class in plat_info['capacity-classes']:
                 avg_capa = mean(
                     capa
                     for cpu, capa in true_capacities.items()
-                    if cpu in cpus
+                    if cpu in capa_class
                 )
-                new_capacities.update({cpu: avg_capa for cpu in cpus})
+                new_capacities.update({cpu: avg_capa for cpu in capa_class})
 
             # Make sure that the max cap is 1024 and that we use integer values
             new_max_cap = max(new_capacities.values())
@@ -312,7 +313,7 @@ class RTA(Workload):
         rta_profile['global'] = global_conf
 
         # Setup tasks parameters
-        for tid, task in sorted(profile.items(), key=lambda k_v: k_v[0]):
+        for tid, task in sorted(profile.items(), key=itemgetter(0)):
             task_conf = {}
 
             if not task.sched_policy:
@@ -492,7 +493,7 @@ class RTA(Workload):
 
         capa_ploads = {
             capacity: {cpu: pload[cpu] for cpu, capa in cpu_caps}
-            for capacity, cpu_caps in groupby(cpu_capacities.items(), lambda k_v: k_v[1])
+            for capacity, cpu_caps in groupby(cpu_capacities.items(), itemgetter(1))
         }
 
         # Find the min pload per capacity level, i.e. the fastest detected CPU.
@@ -532,19 +533,22 @@ class RTA(Workload):
 
         # Map of CPUs X to list of CPUs Ys that are faster than it although CPUs
         # of Ys have a smaller capacity than X
-        faster_than_map = {
-            cpu1: sorted(
-                cpu2
-                for cpu2, pload2 in ploads2.items()
-                # CPU2 faster than CPU1
-                if pload2 < pload1
-            )
-            for (capa1, ploads1), (capa2, ploads2) in itertools.permutations(capa_ploads.items())
-            for cpu1, pload1 in ploads1.items()
-            # Only look at permutations in which CPUs of ploads1 are supposed
-            # to be faster than the one in ploads2
-            if capa1 > capa2
-        }
+        if len(capa_ploads) > 1:
+            faster_than_map = {
+                cpu1: sorted(
+                    cpu2
+                    for cpu2, pload2 in ploads2.items()
+                    # CPU2 faster than CPU1
+                    if pload2 < pload1
+                )
+                for (capa1, ploads1), (capa2, ploads2) in itertools.permutations(capa_ploads.items())
+                for cpu1, pload1 in ploads1.items()
+                # Only look at permutations in which CPUs of ploads1 are supposed
+                # to be faster than the one in ploads2
+                if capa1 > capa2
+            }
+        else:
+            faster_than_map = {}
 
         # Remove empty lists
         faster_than_map = {
@@ -917,7 +921,7 @@ class Pulse(RTATask):
     initial and final load.
 
     The main difference with the 'step' class is that a pulse workload is
-    by definition a 'step down', i.e. the workload switch from an finial
+    by definition a 'step down', i.e. the workload switch from an initial
     load to a final one which is always lower than the initial one.
     Moreover, a pulse load does not generate a sleep phase in case of 0[%]
     load, i.e. the task ends as soon as the non null initial load has
@@ -925,7 +929,7 @@ class Pulse(RTATask):
 
     :param start_pct: the initial load percentage.
     :param end_pct: the final load percentage. Must be lower than ``start_pct``
-                    value. If end_pct is 0, the task end after the ``start_pct``
+                    value. If end_pct is 0, the task ends after the ``start_pct``
                     period has completed.
     :param time_s: the duration in seconds of each load step.
     :param period_ms: the period used to define the load in [ms].
@@ -947,24 +951,21 @@ class Pulse(RTATask):
                  uclamp_min=None, uclamp_max=None):
         super().__init__(delay_s, loops, sched_policy, priority)
 
-        if end_pct >= start_pct:
+        if end_pct > start_pct:
             raise ValueError('end_pct must be lower than start_pct')
 
         if not (0 <= start_pct <= 100 and 0 <= end_pct <= 100):
             raise ValueError('end_pct and start_pct must be in [0..100] range')
 
-        if end_pct >= start_pct:
-            raise ValueError('end_pct must be lower than start_pct')
+        loads = [start_pct]
+        if end_pct:
+            loads += [end_pct]
 
-        phases = []
-        for load in [start_pct, end_pct]:
-            if load == 0:
-                continue
-            phase = Phase(time_s, period_ms, load, cpus, uclamp_min=uclamp_min,
+        self.phases = [
+            Phase(time_s, period_ms, load, cpus, uclamp_min=uclamp_min,
                           uclamp_max=uclamp_max)
-            phases.append(phase)
-
-        self.phases = phases
+            for load in loads
+        ]
 
 
 class Periodic(Pulse):

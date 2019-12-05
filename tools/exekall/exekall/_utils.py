@@ -37,6 +37,8 @@ import uuid
 import glob
 import textwrap
 import argparse
+import time
+import datetime
 
 DB_FILENAME = 'VALUE_DB.pickle.xz'
 
@@ -350,6 +352,12 @@ class ExekallFormatter(logging.Formatter):
             return self.default_fmt.format(record)
 
 
+LOGGING_FOMATTER_MAP = {
+    'normal': ExekallFormatter('[%(asctime)s][%(name)s] %(levelname)s  %(message)s'),
+    'verbose': ExekallFormatter('[%(asctime)s][%(name)s/%(filename)s:%(lineno)s] %(levelname)s  %(message)s'),
+}
+
+
 def setup_logging(log_level, debug_log_file=None, info_log_file=None, verbose=0):
     """
     Setup the :mod:`logging` module.
@@ -372,29 +380,27 @@ def setup_logging(log_level, debug_log_file=None, info_log_file=None, verbose=0)
     logging.addLevelName(LOGGING_OUT_LEVEL, 'OUT')
     level = getattr(logging, log_level.upper())
 
-    verbose_formatter = ExekallFormatter('[%(asctime)s][%(name)s/%(filename)s:%(lineno)s] %(levelname)s  %(message)s')
-    normal_formatter = ExekallFormatter('[%(asctime)s][%(name)s] %(levelname)s  %(message)s')
-
     logger = logging.getLogger()
     # We do not filter anything at the logger level, only at the handler level
     logger.setLevel(logging.NOTSET)
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(level)
-    formatter = verbose_formatter if verbose else normal_formatter
+    formatter = 'verbose' if verbose else 'normal'
+    formatter = LOGGING_FOMATTER_MAP[formatter]
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
     if debug_log_file:
         file_handler = logging.FileHandler(str(debug_log_file), encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(verbose_formatter)
+        file_handler.setFormatter(LOGGING_FOMATTER_MAP['verbose'])
         logger.addHandler(file_handler)
 
     if info_log_file:
         file_handler = logging.FileHandler(str(info_log_file), encoding='utf-8')
         file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(normal_formatter)
+        file_handler.setFormatter(LOGGING_FOMATTER_MAP['normal'])
         logger.addHandler(file_handler)
 
     # Redirect all warnings of the "warnings" module as log entries
@@ -1017,3 +1023,130 @@ def powerset(iterable):
     """
     s = list(iterable)
     return itertools.chain.from_iterable(itertools.combinations(s, r) for r in range(len(s) + 1))
+
+
+def measure_time(iterator):
+    """
+    Measure how long it took to yield each value of the given iterator.
+    """
+    while True:
+        begin = time.monotonic()
+        try:
+            val = next(iterator)
+        except StopIteration:
+            return
+        else:
+            end = time.monotonic()
+            yield (end - begin, val)
+
+
+def capture_log(iterator):
+    logger = logging.getLogger()
+
+    def make_handler(level):
+        formatter = LOGGING_FOMATTER_MAP['normal']
+        string = io.StringIO()
+        handler = logging.StreamHandler(string)
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        return (string, handler)
+
+    def setup():
+        handler_map = {
+            logging.getLevelName(level): make_handler(level)
+            for level in range(logging.NOTSET, logging.CRITICAL, 10)
+        }
+        for string, handler in handler_map.values():
+            logger.addHandler(handler)
+        return handler_map
+
+    def teardown(handler_map):
+        def extract(string, handler):
+            logger.removeHandler(handler)
+            return string.getvalue().rstrip()
+
+        return {
+            name: extract(string, handler)
+            for name, (string, handler) in handler_map.items()
+        }
+
+    while True:
+        handler_map = setup()
+        utc = utc_datetime()
+        try:
+            val = next(iterator)
+        except StopIteration:
+            return
+        else:
+            log_map = teardown(handler_map)
+            yield (utc, log_map, val)
+
+
+class OrderedSetBase:
+    """
+    Base class for custom ordered sets.
+    """
+    def __init__(self, items=[]):
+        self._set = set(items)
+        self._list = list(items)
+
+    def __eq__(self, other):
+        if isinstance(other, self.__class__):
+            return self._set == other._set
+        elif isinstance(other, collections.abc.Sequence):
+            self._set == set(other)
+        else:
+            return False
+
+    def __contains__(self, item):
+        return item in self._set
+
+    def __iter__(self):
+        return iter(self._list)
+
+    def __len__(self):
+        return len(self._list)
+
+
+class FrozenOrderedSet(OrderedSetBase, collections.abc.Set):
+    """
+    Like a regular ``frozenset``, but iterating over it will yield items in insertion
+    order.
+    """
+
+    def __hash__(self):
+        return functools.reduce(
+            lambda hash_, item: hash_ ^ hash(item),
+            self._list,
+            0
+        )
+
+
+class OrderedSet(OrderedSetBase, collections.abc.MutableSet):
+    """
+    Like a regular ``set``, but iterating over it will yield items in insertion
+    order.
+    """
+    def add(self, item):
+        if item in self._set:
+            return
+        else:
+            self._set.add(item)
+            self._list.append(item)
+
+    def update(self, *sets):
+        for s in sets:
+            for x in s:
+                self.add(x)
+
+    def discard(self, item):
+        self._set.discard(item)
+        with contextlib.suppress(ValueError):
+            self._list.remove(item)
+
+
+def utc_datetime():
+    """
+    Return a UTC :class:`datetime.datetime`.
+    """
+    return datetime.datetime.now(datetime.timezone.utc)

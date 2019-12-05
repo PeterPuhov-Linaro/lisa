@@ -31,9 +31,12 @@ import pickletools
 import re
 import importlib
 import sys
+import io
+import datetime
+from operator import attrgetter
 
 import exekall._utils as utils
-from exekall._utils import NoValue
+from exekall._utils import NoValue, OrderedSet, FrozenOrderedSet
 
 
 class NoOperatorError(Exception):
@@ -374,7 +377,7 @@ class ValueDB:
             sets.
         :type deduplicate: bool
         """
-        froz_val_set_set = set()
+        froz_val_set_set = OrderedSet()
 
         # When we reload instances of a class from the DB, we don't
         # want anything else to be able to produce it, since we want to
@@ -394,7 +397,7 @@ class ValueDB:
             wrapped_predicate = predicate
 
         for froz_val_seq in self.froz_val_seq_list:
-            froz_val_set = set()
+            froz_val_set = OrderedSet()
             for froz_val in itertools.chain(
                 # traverse all values, including the ones from the
                 # parameters, even when there was no value computed
@@ -403,7 +406,7 @@ class ValueDB:
             ):
                 froz_val_set.update(froz_val.get_by_predicate(wrapped_predicate))
 
-            froz_val_set_set.add(frozenset(froz_val_set))
+            froz_val_set_set.add(FrozenOrderedSet(froz_val_set))
 
         if flatten:
             return set(utils.flatten_seq(froz_val_set_set))
@@ -424,7 +427,7 @@ class ValueDB:
         subexpressions).
         """
         froz_val_set_set = {
-            frozenset(froz_val_seq)
+            FrozenOrderedSet(froz_val_seq)
             for froz_val_seq in self.froz_val_seq_list
         }
         if flatten:
@@ -584,6 +587,14 @@ class CycleError(Exception):
     pass
 
 
+class AlreadyVisitedException(Exception):
+    """
+    Exception raised when a node has already been visited during a graph
+    traversal.
+    """
+    pass
+
+
 class ExprHelpers(collections.abc.Mapping):
     """
     Helper class used by all expression-like classes.
@@ -608,6 +619,44 @@ class ExprHelpers(collections.abc.Mapping):
     def __hash__(self):
         # consistent with definition of __eq__
         return id(self)
+
+    def fold(self, f, init=None, visit_once=False):
+        """
+        Fold the function ``f`` over the instance and all its parents listed in
+        ``param_map`` attribute, deep first.
+
+        :param f: Function to execute for each instance. It must take two parameters:
+
+            * as first parameter: the return value of the previous invocation
+              of ``f``. For the first call, ``init`` value is used.
+            * as second parameter: the instance of :class:`ExprHelpers` that is being visited.
+
+        :type f: collections.abc.Callable
+
+        :param init: Initial value passed to ``f``.
+        :type init: object
+
+        :param visit_once: If ``True``, each :class:`ExprHelpers` will only be
+            visited once.
+        :type visit_once: bool
+        """
+        visited = set() if visit_once else None
+        return self._fold(f, init, visited=visited)
+
+    def _fold(self, f, x, visited):
+        if visited is not None:
+            if self in visited:
+                raise AlreadyVisitedException
+            else:
+                visited.add(self)
+
+        x = f(x, self)
+
+        for param, param_expr in self.param_map.items():
+            with contextlib.suppress(AlreadyVisitedException):
+                x = param_expr._fold(f, x, visited)
+
+        return x
 
 
 class ExpressionBase(ExprHelpers):
@@ -1739,26 +1788,17 @@ class ComputableExpression(ExpressionBase):
             # successfully.
             if param_map.is_partial():
                 expr_val = ExprVal(self, param_map)
-                expr_val_seq = ExprValSeq.from_one_expr_val(
-                    self, expr_val, param_map,
-                )
+                expr_val_seq = ExprValSeq.from_one_expr_val(expr_val)
                 self.expr_val_seq_list.append(expr_val_seq)
                 yield expr_val
                 continue
 
             # If no value has been found, compute it and save the results in
             # a list.
-            param_val_map = OrderedDict(
-                # Extract the actual computed values wrapped in ExprVal
-                (param, param_expr_val.value)
-                for param, param_expr_val in param_map.items()
-            )
-
-            # Call the operators with its parameters
-            iterator = self.op.generator_wrapper(**param_val_map)
-            expr_val_seq = ExprValSeq(
-                self, iterator, param_map,
-                post_compute_cb
+            expr_val_seq = ExprValSeq.from_expr(
+                expr=self,
+                param_map=param_map,
+                post_compute_cb=post_compute_cb
             )
             self.expr_val_seq_list.append(expr_val_seq)
             yield from expr_val_seq.iter_expr_val()
@@ -1848,12 +1888,12 @@ class ClassContext:
             if isinstance(op, PrebuiltOperator)
         ))
 
-        op_map = dict()
+        op_map = OrderedDict()
         for op in op_set:
             param_map, produced = op.get_prototype()
             is_prebuilt_op = isinstance(op, PrebuiltOperator)
             if is_prebuilt_op or produced not in only_prebuilt_cls:
-                op_map.setdefault(produced, set()).add(op)
+                op_map.setdefault(produced, OrderedSet()).add(op)
         return op_map
 
     @staticmethod
@@ -2658,39 +2698,56 @@ class Operator:
         """
         return self.is_cls_method and issubclass(self.unwrapped_callable.__self__, self.value_type)
 
-    @property
-    def generator_wrapper(self):
+    def make_expr_val_iter(self, expr, param_map):
         """
-        Wrap the callable in a generator suitable for execution.
+        Make an iterator that will yield the computed :class:`ExprVal`.
         """
         if self.is_genfunc:
             @functools.wraps(self.callable_)
-            def genf(*args, **kwargs):
+            def genf(**kwargs):
                 try:
                     has_yielded = False
-                    for res in self.callable_(*args, **kwargs):
+                    for res in self.callable_(**kwargs):
                         has_yielded = True
-                        yield (utils.create_uuid(), res, NoValue)
+                        yield (res, NoValue)
 
                     # If no value at all were produced, we still need to yield
                     # something
                     if not has_yielded:
-                        yield (utils.create_uuid(), NoValue, NoValue)
+                        yield (NoValue, NoValue)
 
                 except Exception as e:
-                    yield (utils.create_uuid(), NoValue, e)
+                    yield (NoValue, e)
         else:
             @functools.wraps(self.callable_)
-            def genf(*args, **kwargs):
-                uuid_ = utils.create_uuid()
+            def genf(**kwargs):
                 # yield one value and then return
                 try:
-                    val = self.callable_(*args, **kwargs)
-                    yield (uuid_, val, NoValue)
+                    val = self.callable_(**kwargs)
                 except Exception as e:
-                    yield (uuid_, NoValue, e)
+                    val = NoValue
+                    excep = e
+                else:
+                    excep = NoValue
 
-        return genf
+                yield (val, excep)
+
+        kwargs = OrderedDict(
+            # Extract the actual computed values wrapped in ExprVal
+            (param, param_expr_val.value)
+            for param, param_expr_val in param_map.items()
+        )
+        for utc, log_map, (duration, (value, excep)) in utils.capture_log(utils.measure_time(genf(**kwargs))):
+            log = ExprValLog(log_map=log_map, utc_datetime=utc)
+            yield ExprVal(
+                expr=expr,
+                param_map=param_map,
+                value=value,
+                excep=excep,
+                uuid=utils.create_uuid(),
+                duration=duration,
+                log=log,
+            )
 
     def get_prototype(self):
         """
@@ -2806,24 +2863,31 @@ class PrebuiltOperator(Operator):
     """
 
     def __init__(self, obj_type, obj_list, id_=None, **kwargs):
-        obj_list_ = list()
-        uuid_list = list()
-        for obj in obj_list:
+        def make_info(obj):
             # Transparently copy the UUID to avoid having multiple UUIDs
             # refering to the same actual value.
             if isinstance(obj, FrozenExprVal):
+                value = obj.value
                 uuid_ = obj.uuid
-                obj = obj.value
+                duration = obj.duration
+                log = obj.log
             else:
+                value = obj
                 uuid_ = utils.create_uuid()
+                duration = None
+                log = None
 
-            uuid_list.append(uuid_)
-            obj_list_.append(obj)
+            return dict(
+                value=value,
+                uuid=uuid_,
+                duration=duration,
+                log=log,
+            )
 
-        # Make sure we will get all objects when using zip()
-        assert len(obj_list) == len(uuid_list)
-        self.obj_list = obj_list_
-        self.uuid_list = uuid_list
+        self.values_info = [
+            make_info(obj)
+            for obj in obj_list
+        ]
         self.obj_type = obj_type
         self._id = id_
 
@@ -2844,17 +2908,22 @@ class PrebuiltOperator(Operator):
 
     @property
     def is_genfunc(self):
-        return len(self.obj_list) > 1
+        return len(self.values_info) > 1
 
     @property
     def is_method(self):
         return False
 
-    @property
-    def generator_wrapper(self):
-        def genf():
-            yield from zip(self.uuid_list, self.obj_list, itertools.repeat(NoValue))
-        return genf
+    def make_expr_val_iter(self, expr, param_map):
+        assert not param_map
+
+        for kwargs in self.values_info:
+            yield ExprVal(
+                expr=expr,
+                excep=NoValue,
+                param_map=ExprValParamMap(),
+                **kwargs
+            )
 
 
 class ConsumerOperator(PrebuiltOperator):
@@ -2885,7 +2954,7 @@ class ConsumerOperator(PrebuiltOperator):
 
     @property
     def consumer(self):
-        return self.obj_list[0]
+        return self.values_info[0]['value']
 
 
 class ExprDataOperator(PrebuiltOperator):
@@ -2906,7 +2975,7 @@ class ExprDataOperator(PrebuiltOperator):
 
     @property
     def data(self):
-        return self.obj_list[0]
+        return self.values_info[0]['value']
 
     @property
     def uuid_list(self):
@@ -2925,8 +2994,8 @@ class ExprValSeq:
         values.
     :type expr: ComputableExpression
 
-    :param iterator: Iterator that yields the values. This is used when the
-        expressions are being executed.
+    :param iterator: Iterator that yields the :class:`ExprVal`. This is used
+        when the expressions are being executed.
     :type iterator: collections.abc.Iterator
 
     :param param_map: Ordered mapping of parameters name to :class:`ExprVal`
@@ -2949,19 +3018,16 @@ class ExprValSeq:
         self.post_compute_cb = post_compute_cb
 
     @classmethod
-    def from_one_expr_val(cls, expr, expr_val, param_map):
+    def from_one_expr_val(cls, expr_val):
         """
         Build an :class:`ExprValSeq` out of a single :class:`ExprVal`.
 
         .. seealso:: :class:`ExprValSeq` for parameters description.
         """
-        iterated = [
-            (expr_val.uuid, expr_val.value, expr_val.excep)
-        ]
         new = cls(
-            expr=expr,
-            iterator=iter(iterated),
-            param_map=param_map,
+            expr=expr_val.expr,
+            iterator=iter([expr_val]),
+            param_map=expr_val.param_map,
             # no post_compute_cb, since we are not really going to compute
             # anything
             post_compute_cb=None,
@@ -2970,6 +3036,22 @@ class ExprValSeq:
         for _ in new.iter_expr_val():
             pass
         return new
+
+
+    @classmethod
+    def from_expr(cls, expr, param_map, **kwargs):
+        """
+        Build an :class:`ExprValSeq` out of a single :class:`ComputableExpression`.
+
+        .. seealso:: :class:`ExprValSeq` for parameters description.
+        """
+        iterator = expr.op.make_expr_val_iter(expr, param_map)
+        return cls(
+            expr=expr,
+            iterator=iterator,
+            param_map=param_map,
+            **kwargs,
+        )
 
     def iter_expr_val(self):
         """
@@ -2981,8 +3063,8 @@ class ExprValSeq:
         if not callback:
             def callback(x, reused): return None
 
-        def yielder(iteratable, reused):
-            for x in iteratable:
+        def yielder(iterable, reused):
+            for x in iterable:
                 callback(x, reused=reused)
                 yield x
 
@@ -2991,14 +3073,7 @@ class ExprValSeq:
 
         # Then compute the remaining ones
         if self.iterator:
-            for uuid_, value, excep in self.iterator:
-                expr_val = ExprVal(
-                    expr=self.expr,
-                    param_map=self.param_map,
-                    value=value,
-                    excep=excep,
-                    uuid=uuid_,
-                )
+            for expr_val in self.iterator:
                 callback(expr_val, reused=False)
 
                 self.expr_val_list.append(expr_val)
@@ -3185,13 +3260,56 @@ class ExprValBase(ExprHelpers):
 
     :param uuid: UUID of the :class:`ExprValBase`
     :type uuid: str
+
+    :param duration: Time it took to compute the value or the exception in
+        seconds.
+    :type duration: float or None
+
+    :param log: Log collected during the computation of the value.
+    :type log: ExprValLog
     """
 
-    def __init__(self, param_map, value, excep, uuid):
+    def __init__(self, param_map, value, excep, uuid, duration, log):
         self.param_map = param_map
         self.value = value
         self.excep = excep
         self.uuid = uuid
+        self.duration = duration
+        self.log = log
+
+    @property
+    def cumulative_duration(self):
+        """
+        Sum of the duration of all :class:`ExprValBase` that were involved in
+        the computation of that one.
+        """
+        def f(duration, expr_val):
+            return duration + (expr_val.duration or 0)
+
+        return self.fold(f, 0, visit_once=True)
+
+    def get_full_log(self, level):
+        """
+        Reconstruct a consistent log output at the given level by stitching the
+        logs of all parent :class:`ExprValBase` that were involved in the
+        computation of that value.
+
+        :param level: Logging level to reconstruct.
+        :type level: str
+        """
+        def f(logs, expr_val):
+            logs.add(expr_val.log)
+            return logs
+
+        logs = self.fold(f, set(), visit_once=True)
+        logs.discard(None)
+        logs = sorted(logs, key=attrgetter('utc_datetime'))
+        level = level.upper()
+        return '\n'.join(
+            log.log_map[level]
+            for log in logs
+            if log.log_map.get(level)
+        )
 
     def get_by_predicate(self, predicate):
         """
@@ -3200,14 +3318,15 @@ class ExprValBase(ExprHelpers):
 
         :type predicate: collections.abc.Callable
         """
-        return list(self._get_by_predicate(predicate))
 
-    def _get_by_predicate(self, predicate):
-        if predicate(self):
-            yield self
+        def _get_by_predicate(self, predicate):
+            if predicate(self):
+                yield self
 
-        for val in self.param_map.values():
-            yield from val._get_by_predicate(predicate)
+            for val in self.param_map.values():
+                yield from _get_by_predicate(val, predicate)
+
+        return list(_get_by_predicate(self, predicate))
 
     def get_excep(self):
         """
@@ -3280,6 +3399,13 @@ class FrozenExprVal(ExprValBase):
     :param uuid: UUID of the :class:`ExprVal`
     :type uuid: str
 
+    :param duration: Time it took to compute the value or the exception in
+        seconds.
+    :type duration: float or None
+
+    :param log: Log collected during the computation of the value.
+    :type log: ExprValLog
+
     :param callable_qualname: Qualified name of the callable that was used to
         compute the value, including module name.
     :type callable_qualname: str
@@ -3311,6 +3437,8 @@ class FrozenExprVal(ExprValBase):
             correlate with logs, or deduplicate across multiple
             :class:`ValueDB`.
 
+        * - ``duration``
+          - Time it took to compute the value in seconds.
 
     Since it is a subclass of :class:`ExprValBase`, the :class:`FrozenExprVal`
     value of the parameters of the callable that was used to compute it can be
@@ -3328,10 +3456,10 @@ class FrozenExprVal(ExprValBase):
     """
 
     def __init__(self,
-                param_map, value, excep, uuid,
-                callable_qualname, callable_name, recorded_id_map,
-                tags,
-            ):
+        param_map, value, excep, uuid, duration, log,
+        callable_qualname, callable_name, recorded_id_map,
+        tags,
+    ):
         self.callable_qualname = callable_qualname
         self.callable_name = callable_name
         self.recorded_id_map = recorded_id_map
@@ -3340,6 +3468,8 @@ class FrozenExprVal(ExprValBase):
             param_map=param_map,
             value=value, excep=excep,
             uuid=uuid,
+            duration=duration,
+            log=log,
         )
 
         if self.excep is not NoValue:
@@ -3492,7 +3622,9 @@ class FrozenExprVal(ExprValBase):
             callable_name=callable_name,
             recorded_id_map=recorded_id_map,
             param_map=param_map,
-            tags=expr_val.get_tags()
+            tags=expr_val.get_tags(),
+            duration=expr_val.duration,
+            log=expr_val.log,
         )
 
         return froz_val
@@ -3542,7 +3674,14 @@ class PrunedFrozVal(FrozenExprVal):
             callable_name=froz_val.callable_name,
             recorded_id_map=copy.copy(froz_val.recorded_id_map),
             tags=froz_val.get_tags(),
+            duration=froz_val.duration,
+            log=None,
         )
+        self._cumulative_duration = froz_val.cumulative_duration
+
+    @property
+    def cumulative_duration(self):
+        return self._cumulative_duration
 
 
 class FrozenExprValSeq(collections.abc.Sequence):
@@ -3607,6 +3746,20 @@ class FrozenExprValSeq(collections.abc.Sequence):
             for expr_val_seq in expr_val_seq_list
         ]
 
+class ExprValLog:
+    """
+    Logging output created when computing an :class:`ExprValBase`.
+
+    :param log_map: Mapping of log level name to log content.
+    :type log_map: dict(str, str)
+
+    :param utc_datetime: UTC timestamp as a datetime object corresponding to
+        the beginning of the log.
+    :type utc_datetime: datetime.datetime
+    """
+    def __init__(self, log_map, utc_datetime):
+        self.log_map = log_map
+        self.utc_datetime = utc_datetime
 
 class ExprVal(ExprValBase):
     """
@@ -3622,11 +3775,22 @@ class ExprVal(ExprValBase):
     """
 
     def __init__(self, expr, param_map,
-        value=NoValue, excep=NoValue, uuid=None,
+        value=NoValue,
+        excep=NoValue,
+        uuid=None,
+        duration=None,
+        log=None,
     ):
         uuid = uuid if uuid is not None else utils.create_uuid()
         self.expr = expr
-        super().__init__(param_map=param_map, value=value, excep=excep, uuid=uuid)
+        super().__init__(
+            param_map=param_map,
+            value=value,
+            excep=excep,
+            uuid=uuid,
+            duration=duration,
+            log=log,
+        )
 
     def get_tags(self):
         """
@@ -3662,14 +3826,12 @@ class ExprVal(ExprValBase):
         Check that the list contains only one :class:`ExprVal` for each
         :class:`ComputableExpression`, unless it is non reusable.
         """
-        expr_map = {}
-
-        def update_map(expr_val1):
+        def update_map(expr_map, expr_val1):
             # The check does not apply for non-reusable operators, since it is
             # expected that the same expression may reference multiple values
             # of the same Expression.
             if not expr_val1.expr.op.reusable:
-                return
+                return expr_map
 
             expr_val2 = expr_map.setdefault(expr_val1.expr, expr_val1)
             # Check that there is only one ExprVal per Expression, for all
@@ -3678,10 +3840,12 @@ class ExprVal(ExprValBase):
             if expr_val2 is not expr_val1:
                 raise ValueError
 
+            return expr_map
+
+        expr_map = {}
         try:
             for expr_val in expr_val_list:
-                # DFS traversal
-                expr_val.get_by_predicate(update_map)
+                expr_val.fold(update_map, expr_map, visit_once=True)
         except ValueError:
             return False
         else:
@@ -3713,6 +3877,8 @@ class UnEvaluatedExprVal(ExprVal):
             uuid=None,
             value=NoValue,
             excep=NoValue,
+            duration=None,
+            log=None,
         )
 
 

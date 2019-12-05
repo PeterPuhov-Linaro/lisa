@@ -30,11 +30,12 @@ from lisa.datautils import series_mean, df_window, df_filter_task_ids, series_tu
 from lisa.wlgen.rta import RTA, Periodic, RTATask
 from lisa.trace import FtraceCollector, requires_events
 from lisa.analysis.load_tracking import LoadTrackingAnalysis
+from lisa.analysis.tasks import TasksAnalysis
 from lisa.pelt import PELT_SCALE, simulate_pelt, pelt_settling_time
 
 UTIL_SCALE = PELT_SCALE
 
-UTIL_CONVERGENCE_TIME_S = pelt_settling_time(0.1, init=0, final=1024)
+UTIL_CONVERGENCE_TIME_S = pelt_settling_time(1, init=0, final=1024)
 """
 Time in seconds for util_avg to converge (i.e. ignored time)
 """
@@ -254,7 +255,8 @@ class InvarianceItem(LoadTrackingBase, ExekallTaggable):
 
         return capacity
 
-    @requires_events('sched_switch')
+    @LoadTrackingAnalysis.df_tasks_signal.used_events
+    @TasksAnalysis.df_task_activation.used_events
     def get_simulated_pelt(self, task, signal_name):
         """
         Simulate a PELT signal for a given task.
@@ -344,7 +346,6 @@ class InvarianceItem(LoadTrackingBase, ExekallTaggable):
         return res_bundle
 
     @get_simulated_pelt.used_events
-    @requires_events('sched_load_se')
     def _test_behaviour(self, signal_name, error_margin_pct):
 
         task = self.task_name
@@ -357,7 +358,7 @@ class InvarianceItem(LoadTrackingBase, ExekallTaggable):
 
         expected_duty_cycle_pct = phase.duty_cycle_pct
         expected_final_util = expected_duty_cycle_pct / 100 * UTIL_SCALE
-        settling_time = pelt_settling_time(1, init=0, final=expected_final_util)
+        settling_time = pelt_settling_time(10, init=0, final=expected_final_util)
         settling_time += df.index[0]
 
         df = df[settling_time:]
