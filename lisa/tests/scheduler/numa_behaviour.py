@@ -21,12 +21,11 @@ import os.path
 import pandas as pd
 
 from lisa.wlgen.rta import Periodic
-from lisa.tests.base import ResultBundle, RTATestBundle
+from lisa.tests.base import ResultBundle, RTATestBundle, TestMetric
 from lisa.utils import ArtifactPath
-from lisa.trace import requires_events
+from lisa.trace import requires_events, FtraceCollector
 from lisa.target import Target
-from lisa.trace import FtraceCollector
-from lisa.datautils import df_filter_task_ids
+from lisa.datautils import df_filter_task_ids, df_deduplicate
 
 class NUMABehaviour(RTATestBundle):
     """
@@ -35,68 +34,58 @@ class NUMABehaviour(RTATestBundle):
     This class provides :meth:`test_task_placement` to validate the basic
     behaviour of NUMA related scheduling decisions. 
     """
-
     @classmethod
-    def _from_target(cls, target: Target, *, res_dir: ArtifactPath = None, ftrace_coll: FtraceCollector = None) -> 'NUMABehaviour':
-        """
-        Factory method to create a bundle using a live target
+    def check_from_target(cls, target):
+        if target.number_of_nodes < 2:
+            raise CannotCreateError(
+                "Target doesn't have at least two NUMA nodes")
 
-        This will execute the rt-app workload described in
-        :meth:`lisa.tests.base.RTATestBundle.get_rtapp_profile`
-        """
-        plat_info = target.plat_info
-        rtapp_profile = cls.get_rtapp_profile(plat_info)
-
-        cls.run_rtapp(target, res_dir, rtapp_profile, ftrace_coll=ftrace_coll)
-
-        return cls(res_dir, plat_info)
-
-    def _get_task_cpu_df(self, task):
+    @requires_events('sched_switch')
+    def _get_task_cpu_df(self, task_id):
         """
         Get a DataFrame for task mirgrations
 
         Use the sched_switch trace event to find task mirgation from one CPU to another.
 
         :returns: A Pandas DataFrame for the task, showing the
-                  new CPU that the task was migrated to
+                  CPU's that the task was migrated to
         """        
         df = self.trace.df_events('sched_switch')[['next_pid', 'next_comm', '__cpu']]
-        task_id = self.trace.get_task_id(task, update=False)
-        _df = df_filter_task_ids(df, [task_id], pid_col='next_pid', comm_col='next_comm')
-        cpu_df = _df.drop_duplicates(subset='__cpu', keep='first', inplace=False)
+        cpu_df = df_filter_task_ids(df, [task_id], pid_col='next_pid', comm_col='next_comm')
+        cpu_df = df_deduplicate(cpu_df, cols=['__cpu'], keep='first', consecutives=True)
                 
         return cpu_df
 
-    @requires_events('sched_switch')
-    def test_task_placement(self) -> ResultBundle:
+    @_get_task_cpu_df.used_events
+    def test_task_remains(self) -> ResultBundle:
         """
-        Test that task remained on the same core 
+        Test that task remaines on the same core 
 
         """
         test_passed = True
-        failed_tasks = []
+        metrics = {}
         
-        for task in self.rtapp_tasks:
-            cpu_df = self._get_task_cpu_df(task)
+        for task_id in self.rtapp_task_ids:
+            cpu_df = self._get_task_cpu_df(task_id)
             core_migrations = len(cpu_df.index)
-            # Ideally, task with low utilization
-            # should stay on the same core and
-            # do not cross NUMA boundaries
+            metrics[task_id] = TestMetric(core_migrations)
+
+            # Ideally, task with 50% utilization
+            # should stay on the same core
             if  core_migrations > 1:
                 test_passed = False
-                failed_tasks.append("{} core_migrations {}".format(task, core_migrations))
 
         res = ResultBundle.from_bool(test_passed)
-        res.add_metric("Failed tasks", failed_tasks)
+        res.add_metric("Migrations", metrics)
         
         return res
 
-class NUMA_SmallTaskPlacement(NUMABehaviour):
+class NUMASmallTaskPlacement(NUMABehaviour):
     """
     A single task with 50% utilization
     """
 
-    task_prefix = "ntask"
+    task_prefix = "tsk"
 
     @classmethod
     def get_rtapp_profile(cls, plat_info):
@@ -109,11 +98,11 @@ class NUMA_SmallTaskPlacement(NUMABehaviour):
 
         return rtapp_profile
     
-class NUMA_MultipleTasksPlacement(NUMABehaviour):
+class NUMAMultipleTasksPlacement(NUMABehaviour):
     """
     Multiple tasks with 50% utilization
     """
-    task_prefix = "ntask"
+    task_prefix = "tsk"
     
     @classmethod
     def get_rtapp_profile(cls, plat_info):
@@ -122,7 +111,7 @@ class NUMA_MultipleTasksPlacement(NUMABehaviour):
 
         rtapp_profile = {}
         for cpu in range(cpu_count):            
-            rtapp_profile["{}_{}".format(cls.task_prefix, cpu)] = Periodic(
+            rtapp_profile["{}{}".format(cls.task_prefix, cpu)] = Periodic(
                 duty_cycle_pct=50,
                 duration_s=30,
                 period_ms=cls.TASK_PERIOD_MS
