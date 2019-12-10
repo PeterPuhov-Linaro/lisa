@@ -50,9 +50,8 @@ class NUMABehaviour(RTATestBundle):
         :returns: A Pandas DataFrame for the task, showing the
                   CPU's that the task was migrated to
         """        
-        df = self.trace.df_events('sched_switch')[['next_pid', 'next_comm', '__cpu']]
-        cpu_df = df_filter_task_ids(df, [task_id], pid_col='next_pid', comm_col='next_comm')
-        cpu_df = df_deduplicate(cpu_df, cols=['__cpu'], keep='first', consecutives=True)
+        df = self.trace.analysis.tasks.df_task_states(task_id)
+        cpu_df = df_deduplicate(df, cols=['cpu'], keep='first', consecutives=True)
                 
         return cpu_df
 
