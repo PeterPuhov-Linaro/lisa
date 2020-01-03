@@ -1,0 +1,81 @@
+
+# LISA Target configuration required by devlib to connect to a target.
+#
+# See the doc for available keys:
+# https://lisa-linux-integrated-system-analysis.readthedocs.io/en/master/target.html#lisa.target.TargetConf
+#
+
+target-conf:
+    # Kind of platform
+    # - linux   : accessed via SSH connection
+    # - android : accessed via ADB connection
+    # - host    : run on the local host
+    kind : linux
+
+    # Board
+    # Optional board name used for better prettier logs 
+    name: arm3
+
+    # Target IP or domain name
+    # host: 10.124.48.244
+    host: 127.0.0.1
+
+    # Target Android device ID
+    # device: 00b1346f0878ccb1
+
+    # Login username (has to be sudo enabled)
+    username: root
+
+    # Login credentials
+    # You can specify either a password or keyfile
+    # password: "cdb!"
+    keyfile: /home/peter/.ssh/id_rsa
+    port: 5555
+
+    # Optional devlib configuration
+    # devlib:
+        # Devlib modules names to enable/disbale for all the experiment
+        # excluded-modules: [ "cgroups" , "cpufreq" ]
+        #
+        # devlib Platform sublcass to use, with the keyword arguments to use it
+        # platform:
+            # Defaults to devlib.platform.Platform
+            # class: devlib.platform.Platform
+            # args:
+                # arg1: foo
+                # arg2: bar
+
+    # Optional additional binary tools to install by default for all experiments
+    # Currently available tools:
+    # - binaries under ./tools/<ARCH>/
+    #   where <ARCH> is one of the supported target
+    #   architectures
+    # - shell scripts under './tools/scripts/
+    # tools: []
+    #
+
+# Ftrace collector configuration
+ftrace-conf:
+    # Additional ftrace events and functions collected regardless of the
+    # test configuration
+    # events: []
+    # functions: []
+    #
+    # ftrace buffer size
+    # buffer-size: 100000
+
+# Platform information
+#
+# Various bits of information about the platform used by LISA
+#
+platform-info:
+    # Include a preset platform-info file, instead of defining the keys directly here.
+    # Note that you cannot use !include and define keys at the same time.
+    # !include $LISA_HOME/lisa/platforms/juno_r0.yml
+    conf:
+        rtapp:
+            # # Calibration mapping of CPU numbers to calibration value for rtapp
+            # calib: {0: 107, 1: 107, 2: 107, 3: 107, 4: 107, 5: 107, 6: 107, 7: 107}
+            # calib: {0: 107, 1: 107, 2: 107, 3: 107, 4: 107, 5: 107, 6: 107, 7: 107, 8: 107, 9: 107, 10: 107, 11: 107, 12: 107, 13: 107, 14: 107, 15: 107}
+            # calib: {0: 107, 1: 107, 2: 107, 3: 107, 4: 107, 5: 107, 6: 107, 7: 107, 8: 107, 9: 107, 10: 107, 11: 107, 12: 107, 13: 107, 14: 107, 15: 107, 16: 107, 17: 107, 18: 107, 19: 107, 20: 107, 21: 107, 22: 107, 23: 107, 24: 107, 25: 107, 26: 107, 27: 107, 28: 107, 29: 107, 30: 107, 31: 107, 32: 107, 33: 107, 34: 107, 35: 107, 36: 107, 37: 107, 38: 107, 39: 107, 40: 107, 41: 107, 42: 107, 43: 107, 44: 107, 45: 107, 46: 107, 47: 107, 48: 107, 49: 107, 50: 107, 51: 107, 52: 107, 53: 107, 54: 107, 55: 107, 56: 107, 57: 107, 58: 107, 59: 107, 60: 107, 61: 107, 62: 107, 63: 107}            
+            calib: {0: 2250, 1: 2250, 2: 2250, 3: 2250, 4: 2250, 5: 2250, 6: 2250, 7: 2250, 8: 2250, 9: 2250, 10: 2250, 11: 2250, 12: 2250, 13: 2250, 14: 2250, 15: 2250}
